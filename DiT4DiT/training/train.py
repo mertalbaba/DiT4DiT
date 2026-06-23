@@ -430,35 +430,65 @@ class VLATrainer(TrainerUtils):
         # execute evaluation step
 
     def eval_action_model(self, step_metrics: dict = None) -> float:
-        """
-        Evaluate the model on the given dataset using the specified metric function.
-
-        :param eval_dataset: List of evaluation samples, each containing 'image', 'instruction', and 'action'.
-        :param metric_fn: Function to compute the distance between predicted and ground truth actions.
-        :return: Average metric score across the evaluation dataset.
-        """
+        """Held-out eval. For the SONIC token arm (dataset_py=='sonic_token') this mirrors the pi0.5
+        arm: token MSE/MAE/cosine/fsq_top1 over VALID tokens of the held-out HE eval split, logged
+        as eval/token_*. For other configs it keeps the original next-batch masked-MSE behavior."""
+        if self.config.datasets.vla_data.get("dataset_py", "") == "sonic_token":
+            return self._eval_sonic_tokens(step_metrics)
 
         examples = self._get_next_batch()
-        score = 0.0
-        num_samples = len(examples)
         actions = [example["action"] for example in examples]  # label
-        # Predict actions using the model
-        action_mask = [example["action_mask"] for example in examples] # [B, len, action_dim]
-        output_dict = self.model.predict_action(
-            examples=examples, use_ddim=True, num_ddim_steps=20
-        )
-
+        action_mask = [example["action_mask"] for example in examples]  # [B, len, action_dim]
+        output_dict = self.model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]  # B, T, D
-            actions = np.array(actions)  # convert actions to numpy.ndarray
-            action_mask = np.array(action_mask)  # convert action_mask to numpy.ndarray [B, T, D]
-            # Apply action_mask: only compute MSE on valid (True) dimensions
+            actions = np.array(actions)
+            action_mask = np.array(action_mask)
             masked_diff = (normalized_actions - actions) * action_mask
-            mse = (masked_diff ** 2).sum() / action_mask.sum()
-            step_metrics["mse_score"] = mse
-
+            step_metrics["mse_score"] = (masked_diff ** 2).sum() / action_mask.sum()
         del examples
-        dist.barrier()  # ensure all processes are synchronized
+        dist.barrier()
+        return step_metrics
+
+    def _build_sonic_eval_loader(self):
+        """Held-out eval loader (split='eval', no history dropout, a small fixed sample count) built
+        from the SAME training config -> exactly the held-out HE eval split the pi0.5 arm uses."""
+        from torch.utils.data import DataLoader
+        from DiT4DiT.dataloader.sonic_token_dataset import get_sonic_vla_dataset, collate_fn
+        bs = int(self.config.datasets.vla_data.per_device_batch_size)
+        n_batches = int(self.config.trainer.get("eval_batches", 8))
+        ds = get_sonic_vla_dataset(
+            self.config, split_override="eval",
+            samples_per_epoch_override=max(n_batches * bs, bs),
+            history_dropout_override=0.0,
+        )
+        return DataLoader(ds, batch_size=bs, collate_fn=collate_fn, num_workers=2)
+
+    def _eval_sonic_tokens(self, step_metrics):
+        """Token-prediction metrics (MSE/MAE/cos/fsq_top1 over valid tokens) on the held-out eval
+        split -> step_metrics['eval/token_*'] (logged to wandb by _log_metrics)."""
+        # importing the dataloader module puts the repo root on sys.path (multi-cluster safe), so the
+        # shared token_metrics helper is importable; the module is already imported by build_dataloader.
+        from DiT4DiT.dataloader import sonic_token_dataset as _sd  # noqa: F401  (path side-effect)
+        from pi05_sonic_vla.eval.token_metrics import token_metrics
+
+        if not hasattr(self, "_sonic_eval_loader"):
+            self._sonic_eval_loader = self._build_sonic_eval_loader()
+
+        accum = []
+        for examples in self._sonic_eval_loader:
+            out = self.model.predict_action(examples=examples)
+            if self.accelerator.is_main_process:
+                pred = np.asarray(out["normalized_actions"], np.float32)              # (B, H, D)
+                gt = np.asarray([e["action"] for e in examples], np.float32)          # (B, H, D)
+                mask = np.asarray([e["action_mask"] for e in examples], np.float32)   # (B, H, D)
+                valid = mask[..., 0] > 0.5                                            # (B, H)
+                accum.append(token_metrics(pred, gt, valid))
+        if self.accelerator.is_main_process and accum:
+            for k in (kk for kk in accum[0] if kk != "n_valid_tokens"):
+                step_metrics[f"eval/{k}"] = float(np.nanmean([a[k] for a in accum]))
+            step_metrics["eval/n_valid_tokens"] = int(sum(a["n_valid_tokens"] for a in accum))
+        dist.barrier()
         return step_metrics
 
     def _log_training_config(self):

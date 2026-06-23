@@ -160,11 +160,14 @@ def _corpora_from_env() -> list[CorpusSpec]:
     ]
 
 
-def get_sonic_vla_dataset(cfg) -> SonicVideoTokenDataset:
+def get_sonic_vla_dataset(cfg, split_override=None, samples_per_epoch_override=None,
+                          history_dropout_override=None) -> SonicVideoTokenDataset:
     """Build the dataset from a DiT4DiT OmegaConf `cfg`.
 
     horizon is taken from the action head (future_action_window_size + 1) so the token chunk
     matches what `DiT4DiT.forward` slices; data window params default to the pi0.5 arm's values.
+    The *_override args let the trainer build a held-out eval loader (split="eval", no history
+    dropout, a small fixed number of samples) from the same config.
     """
     d = cfg.datasets.vla_data
     am = cfg.framework.action_model
@@ -180,13 +183,15 @@ def get_sonic_vla_dataset(cfg) -> SonicVideoTokenDataset:
         horizon=horizon,
         history=int(d.get("history", 50)),
         history_stride=int(d.get("history_stride", 4)),
-        history_dropout=float(d.get("history_dropout", 0.5)),
+        history_dropout=float(history_dropout_override if history_dropout_override is not None
+                              else d.get("history_dropout", 0.5)),
         min_valid_frac=float(d.get("min_valid_frac", 0.9)),
         image_size=image_size,
         load_images=bool(d.get("load_images", True)),
-        samples_per_epoch=int(d.get("samples_per_epoch", 200_000)),
+        samples_per_epoch=int(samples_per_epoch_override if samples_per_epoch_override is not None
+                              else d.get("samples_per_epoch", 200_000)),
         seed=int(cfg.get("seed", 42)),
-        split=str(d.get("split", "train")),
+        split=str(split_override if split_override is not None else d.get("split", "train")),
         test_frac=float(d.get("test_frac", 0.12)),
         test_category=str(d.get("test_category", "Locomanip")),
         train_exclude_corpora=tuple(d.get("train_exclude_corpora", ()) or ()),

@@ -86,6 +86,7 @@ trainer:
   num_warmup_steps: 5000
   save_interval: 5000
   eval_interval: 500
+  eval_batches: 8          # held-out HE eval batches -> wandb eval/token_{mse,mae,cos},fsq_top1
   learning_rate:
     base: 1e-05
     backbone_interface: 1.0e-05

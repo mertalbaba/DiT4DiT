@@ -191,6 +191,12 @@ are outside the token space and out of scope here (same as the pi0.5 arm).
       on the smoke checkpoint: `load_state_dict` missing=0/unexpected=0, correct `.npz`. The eval
       path uses raw `predict_action` output (no `unnormalize_actions`), so the q01/q99 + channel-6
       hardcode is moot here — it only matters for deployment.
+- [x] **In-loop wandb eval (pi0.5-parity).** `train.py:eval_action_model` now branches for the
+      token arm (`dataset_py=='sonic_token'`): every `eval_interval`, it runs the held-out HE
+      `split='eval'` loader (no history dropout) through `predict_action` and logs
+      `eval/token_{mse,mae,cos}` + `eval/fsq_top1` (shared `pi05_sonic_vla.eval.token_metrics`) to
+      wandb -- vs the old single `mse_score` on a *training* batch. `eval_batches` config knob (8).
+      Non-token configs keep the original behavior. (Applies to new runs / resumes, not a live job.)
 - [x] **Condor training scripts** (`dit4dit_sonic_vla/condor/`): `run_dit4dit_sonic.sh`
       (accelerate+deepspeed, 8×A100-80GB, resume-if-checkpoint, HF-offline Cosmos, /fast ckpts,
       text_encoder+vae frozen by default, local TRITON_CACHE to dodge the flock teardown hang) +
