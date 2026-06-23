@@ -92,13 +92,36 @@ class DiT4DiT(baseframework):
             self.future_action_window_size = config.framework.action_model.future_action_window_size
             self.past_action_window_size = config.framework.action_model.past_action_window_size
             self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
+            # Fully-latent SONIC arm: condition the action DiT on the previous-token history by
+            # projecting it into extra cross-attention context tokens (readme_sonic.md TODO 3).
+            # Off by default so the original DiT4DiT configs/data path are unaffected.
+            self.use_prev_tokens = bool(config.framework.action_model.get("use_prev_tokens", False))
+            self.prev_token_proj = (
+                nn.Linear(config.framework.action_model.action_dim, vl_hidden_dim)
+                if self.use_prev_tokens else None
+            )
         else:
             # Video-only mode: skip action model entirely
             self.action_model = None
             self.future_action_window_size = 0
             self.past_action_window_size = 0
             self.chunk_len = 0
-        
+            self.prev_token_proj = None
+
+
+    def _append_prev_token_context(self, last_hidden, examples):
+        """Project the previous-token history into extra cross-attention context tokens for the
+        action DiT (fully-latent SONIC arm -- readme_sonic.md TODO 3). No-op when disabled or when
+        examples carry no `prev_tokens` (keeps the original DiT4DiT data path unchanged)."""
+        if last_hidden is None or getattr(self, "prev_token_proj", None) is None:
+            return last_hidden
+        if not examples or "prev_tokens" not in examples[0]:
+            return last_hidden
+        prev = torch.tensor(
+            np.array([ex["prev_tokens"] for ex in examples]),
+            device=last_hidden.device, dtype=last_hidden.dtype,
+        )  # (B, history, action_dim)
+        return torch.cat([last_hidden, self.prev_token_proj(prev)], dim=1)
 
     def forward(
         self,
@@ -125,6 +148,7 @@ class DiT4DiT(baseframework):
             # last_hidden_state: [B, seq_len, H]
             if not self.video_fm_only:
                 last_hidden = backbone_outputs.hidden_states[-1]  # [B, L, H] ##2560-4b
+                last_hidden = self._append_prev_token_context(last_hidden, examples)
             else:
                 last_hidden = None
             future_video_loss = getattr(backbone_outputs, "future_video_loss", None)
@@ -214,6 +238,7 @@ class DiT4DiT(baseframework):
 
             # last_hidden_state: [B, seq_len, H]
             last_hidden = backbone_outputs.hidden_states[-1]   # [B, L, H]
+            last_hidden = self._append_prev_token_context(last_hidden, examples)
 
         state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
         

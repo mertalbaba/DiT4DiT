@@ -1,0 +1,115 @@
+# DiT4DiT-SONIC: world-model-backbone arm of the SONIC token VLA. See ../../../readme_sonic.md.
+# Predicts the SONIC motion-token chunk (action.motion_token, 64-d FSQ) instead of raw joints;
+# joint mode keeps the Cosmos future-video FM loss on. Whole-body token mode (the frozen SONIC
+# decoder owns balance) -- NOT decoupled-WBC. Fully latent: ego pixels + language + prev tokens,
+# no proprio (state_dim = 0). Data + splits are byte-identical to the pi0.5 arm (`pi05_sonic`).
+run_id: dit4dit_sonic
+run_root_dir: results/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: rlforimitation
+wandb_project: humanoid-vla
+is_debug: false
+
+framework:
+  name: DiT4DiT
+  cosmos25:
+    future_num_inference_steps: 1
+    future_loss_type: flow_matching
+    extract_layer: 17
+    base_model: /fast/malbaba/hfcache/Cosmos-Predict2.5-2B
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2048
+    training: joint                              # joint = action_loss + future_video_loss
+    flow_matching:
+      time_distribution: logit_normal
+      high_sigma_ratio: 0.05
+      high_sigma_min: 0.98
+    conditional_frame_timestep: 0.0001
+
+  action_model:
+    action_model_type: DiT-B
+    hidden_size: 2560
+    add_pos_embed: True
+    max_seq_len: 1024
+    action_dim: 64                # SONIC FSQ token (was 36 raw upper-body joints)
+    state_dim: 0                  # fully latent -- no proprio (state_encoder disabled)
+    use_prev_tokens: true         # condition on prev-token history (projected into cross-attn context)
+    future_action_window_size: 49 # -> action_horizon 50 = the [50, 64] / 1 s SONIC chunk
+    action_horizon: 50            # MUST equal future_action_window_size + 1 (head uses both)
+    past_action_window_size: 0
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048   # Cosmos hidden dim (vl_hidden_dim)
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      output_dim: 2560
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: sonic_token       # -> DiT4DiT/dataloader/sonic_token_dataset.py (bypasses GR00T loader)
+    include_state: false
+    default_image_resolution: [3, 224, 224]
+    image_size: [224, 224]
+    per_device_batch_size: 4      # 2B video backbone + clip; raise if memory allows
+    num_workers: 4
+    # video FM clip: cond frame 0 + future frames; offsets span ~1 s to match the token window.
+    # backbone num_frames_out = len(range(0, len(video_delta_indices), action_video_freq_ratio)).
+    video_delta_indices: [0, 12, 24, 36, 48]
+    action_video_freq_ratio: 1    # -> 5 frames (1 cond + 4 future)
+    max_state_dim: 0
+    max_action_dim: 64
+    # token-dataset knobs (defaults mirror the pi0.5 arm's SonicTokenDataConfig)
+    history: 50                   # prev-token history length (TODO 3 consumes it)
+    history_stride: 4
+    history_dropout: 0.5
+    min_valid_frac: 0.9
+    samples_per_epoch: 200000
+    split: train                  # held out: ~5% HE eval + Locomanip test_locomotion
+    test_frac: 0.12
+    test_category: Locomanip
+    train_exclude_corpora: []
+
+trainer:
+  epochs: 100
+  max_train_steps: 200000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  eval_interval: 500
+  learning_rate:
+    base: 1e-05
+    backbone_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ''
+  repeated_diffusion_steps: 4
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true

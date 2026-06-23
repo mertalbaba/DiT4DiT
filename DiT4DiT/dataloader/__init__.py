@@ -39,20 +39,38 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"):
         vla_dataset_cfg = cfg.datasets.vla_data
 
         vla_dataset = get_vla_dataset(data_cfg=vla_dataset_cfg)
-        
+
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
             num_workers=4,
             # shuffle=True
-        )        
-        if dist.get_rank() == 0: 
-            
+        )
+        if dist.get_rank() == 0:
+
             output_dir = Path(cfg.output_dir)
             vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
         return vla_train_dataloader
-        
+
+    elif dataset_py == "sonic_token":
+        # SONIC token target -- the world-model-backbone arm (see ../readme_sonic.md, TODO 1).
+        # Bypasses the GR00T LeRobot/transform stack and reuses the canonical token dataset so
+        # splits match the pi0.5 arm byte-for-byte; FSQ tokens -> identity norm (no stats).
+        from DiT4DiT.dataloader.sonic_token_dataset import (
+            get_sonic_vla_dataset, collate_fn, save_identity_statistics,
+        )
+        vla_dataset = get_sonic_vla_dataset(cfg)
+        vla_train_dataloader = DataLoader(
+            vla_dataset,
+            batch_size=cfg.datasets.vla_data.per_device_batch_size,
+            collate_fn=collate_fn,
+            num_workers=int(cfg.datasets.vla_data.get("num_workers", 4)),
+        )
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
+            save_identity_statistics(Path(cfg.output_dir) / "dataset_statistics.json")
+        return vla_train_dataloader
+
     else:
         raise NotImplementedError(f"Dataset {dataset_py} is not supported yet")
         

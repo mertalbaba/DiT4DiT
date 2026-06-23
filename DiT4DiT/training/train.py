@@ -93,7 +93,7 @@ from DiT4DiT.dataloader import build_dataloader
 def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
     """prepare training data"""
     # VLA data loader
-    logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
+    logger.info(f"Creating VLA Dataset `{cfg.datasets.vla_data.get('data_mix', cfg.datasets.vla_data.dataset_py)}`")
     # Access in main process so this key is tracked and persisted by AccessTrackedConfig.
     action_video_freq_ratio = cfg.datasets.vla_data.get("action_video_freq_ratio", 1)
     logger.info(f"Using action_video_freq_ratio={action_video_freq_ratio}")
