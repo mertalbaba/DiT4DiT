@@ -176,10 +176,26 @@ are outside the token space and out of scope here (same as the pi0.5 arm).
 - [x] **5. Shape/contract validation.** Covered by `validate_backbone.py` (full chain on GPU) +
       the dataloader self-test (`sonic_token_dataset.py --no-images`, CPU). A pure-CPU full-model
       check isn't practical here — the Cosmos backbone needs a GPU (unlike the pi0.5 jax.eval_shape).
-- [ ] **6. Smoke train** (tiny subset, few steps) — both losses decrease; no NaNs; checkpoint
-      saves/loads (`from_pretrained` with identity norm_stats).
-- [ ] **7. Eval adapter** to the shared `../pi05_sonic_vla/eval/` harness (same `.npz`); produce
-      `GT‖pred` decoded videos + token metrics for a DiT4DiT checkpoint.
+- [x] **6. Smoke train — PASSED (save; load pending).** 6 steps on 1×A100-80GB
+      (`accelerate launch --config_file .../deepspeed_zero2.yaml --num_processes 1`, text_encoder+vae
+      frozen, ~77 GB peak): both losses finite + video loss moving (0.487→0.406), eval path runs
+      (`mse_score`), 20 GB `steps_4_pytorch_model.pt` written to `/fast`. NOTE: DiT4DiT detaches
+      backbone features for the action loss (`Cosmos25.forward(detach=True)`), so the backbone trains
+      ONLY via the video-FM loss and the head/`prev_token_proj` only via the action loss. Still TODO:
+      reload via `from_pretrained` (+ the `base_framework.unnormalize_actions` token bypass, TODO 7).
+      Launch: `dit4dit/`, env `HF_HUB_OFFLINE=1 HF_HOME=/fast/malbaba/hfcache WANDB_MODE=offline`.
+- [x] **7. Eval adapter — DONE + verified.** `dit4dit_sonic_vla/eval/predict_chunks.py` (DiT4DiT
+      `predict_action` → identical pi05 `ep*.npz{pred,gt,instruction,init_*}` + `metrics.json`,
+      shared `token_metrics`, same held-out episodes) + `eval/run_sim_eval.sh` (predict in dit4dit
+      venv → decode/render via `.venv_sim` reusing pi05's `decode_and_render.py` verbatim). Verified
+      on the smoke checkpoint: `load_state_dict` missing=0/unexpected=0, correct `.npz`. The eval
+      path uses raw `predict_action` output (no `unnormalize_actions`), so the q01/q99 + channel-6
+      hardcode is moot here — it only matters for deployment.
+- [x] **Condor training scripts** (`dit4dit_sonic_vla/condor/`): `run_dit4dit_sonic.sh`
+      (accelerate+deepspeed, 8×A100-80GB, resume-if-checkpoint, HF-offline Cosmos, /fast ckpts,
+      text_encoder+vae frozen by default, local TRITON_CACHE to dodge the flock teardown hang) +
+      `dit4dit_sonic.sub`. Data/split = pi0.5 setup: all 3 corpora in training; HE held out 5% eval
+      (random) + 12% of Locomanip as test_locomotion (`test_frac=0.12`, `test_category=Locomanip`).
 - [ ] **8. Full train on HE (100 % data)**; report token MSE/cos + decoded fidelity + LeVERB sim
       vs the `pi05_sonic` arm on the identical `eval` / `test_locomotion` splits.
 - [ ] **9. Data-efficiency curve** (the money plot): retrain both arms at {5, 10, 25, 50, 100} % of
