@@ -18,7 +18,7 @@ framework:
     future_loss_type: flow_matching
     extract_layer: 17
     base_model: /fast/malbaba/hfcache/Cosmos-Predict2.5-2B
-    attn_implementation: flash_attention_2
+    attn_implementation: sdpa             # B200 sdpa already uses fused/flash kernels; flash-attn sm_100 build is fragile (override via ATTN=flash_attention_2)
     vl_hidden_dim: 2048
     training: joint                              # joint = action_loss + future_video_loss
     flow_matching:
@@ -76,7 +76,7 @@ datasets:
     min_valid_frac: 0.9
     samples_per_epoch: 200000
     split: train                  # held out: ~5% HE eval + Locomanip test_locomotion
-    test_frac: 0.12
+    test_frac: 0.15               # match the pi05_sonic runs -> identical 134-episode held-out test (was 0.12 = stale)
     test_category: Locomanip
     train_exclude_corpora: []
 
