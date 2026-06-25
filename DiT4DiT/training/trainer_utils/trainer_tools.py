@@ -248,11 +248,23 @@ class TrainerUtils:
                         print(f"⚠️ parameters not found in checkpoint '{path}'")
                 except AttributeError:
                     print(f"❌ cannot find module path: {path}")
-        else:  # full load
+        else:  # full load -- drop SHAPE-incompatible keys before loading. strict=False ignores
+            # missing/unexpected KEYS but still raises on shape mismatches of existing keys, which
+            # breaks cross-embodiment warm-start (e.g. robocasa action_dim 32 vs SONIC 64). Filter
+            # those out and let them reinit; everything shape-compatible (backbone + DiT layers) loads.
             try:
-                model.load_state_dict(checkpoint, strict=False)
+                msd = model.state_dict()
+                kept = {k: v for k, v in checkpoint.items()
+                        if k in msd and hasattr(v, "shape") and tuple(v.shape) == tuple(msd[k].shape)}
+                dropped = [k for k in checkpoint
+                           if k in msd and hasattr(checkpoint[k], "shape")
+                           and tuple(checkpoint[k].shape) != tuple(msd[k].shape)]
+                model.load_state_dict(kept, strict=False)
                 if dist.get_rank() == 0:
-                    print("✅ loaded <full_model> model parameters")
+                    print(f"✅ loaded <full_model> ({len(kept)} shape-compatible tensors)")
+                    if dropped:
+                        print(f"⚠️ {len(dropped)} shape-mismatched key(s) reinit (not loaded): "
+                              f"{dropped[:6]}{'...' if len(dropped) > 6 else ''}")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
                 raise RuntimeError(f"❌ loading full model failed: {e}")
