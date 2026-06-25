@@ -43,7 +43,7 @@ framework:
     noise_beta_beta: 1.0
     noise_s: 0.999
     num_timestep_buckets: 1000
-    num_inference_timesteps: 20   # inference-only flow Euler steps (training is continuous-time, no steps). 4 under-sampled -> eval token-cos floored ~0.6 despite low train loss. 20 = the eval's intended num_ddim_steps; pi0.5 uses 10.
+    num_inference_timesteps: 10   # inference-only flow Euler steps (training is continuous-time). Matched to pi0.5 for an apples-to-apples token-cos comparison. (4 under-sampled -> eval floored ~0.6.)
     num_target_vision_tokens: 32
     diffusion_model_cfg:
       cross_attention_dim: 2048   # Cosmos hidden dim (vl_hidden_dim)
