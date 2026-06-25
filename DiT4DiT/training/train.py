@@ -450,33 +450,28 @@ class VLATrainer(TrainerUtils):
         dist.barrier()
         return step_metrics
 
-    def _build_sonic_eval_loader(self):
-        """Held-out eval loader (split='eval', no history dropout, a small fixed sample count) built
-        from the SAME training config -> exactly the held-out HE eval split the pi0.5 arm uses."""
+    def _build_sonic_eval_loader(self, split="eval"):
+        """Token-metric loader for a given split ('eval' = held-out HE; 'train' = in-distribution):
+        no history dropout, a small fixed sample count, built from the SAME training config. The
+        'train' loader lets us log train/token_* next to eval/token_* so overfitting is directly
+        visible (train_cos >> eval_cos => memorizing; train_cos ~= eval_cos => the conditioning/
+        architecture is the ceiling, not generalization)."""
         from torch.utils.data import DataLoader
         from DiT4DiT.dataloader.sonic_token_dataset import get_sonic_vla_dataset, collate_fn
         bs = int(self.config.datasets.vla_data.per_device_batch_size)
         n_batches = int(self.config.trainer.get("eval_batches", 8))
         ds = get_sonic_vla_dataset(
-            self.config, split_override="eval",
+            self.config, split_override=split,
             samples_per_epoch_override=max(n_batches * bs, bs),
             history_dropout_override=0.0,
         )
         return DataLoader(ds, batch_size=bs, collate_fn=collate_fn, num_workers=2)
 
-    def _eval_sonic_tokens(self, step_metrics):
-        """Token-prediction metrics (MSE/MAE/cos/fsq_top1 over valid tokens) on the held-out eval
-        split -> step_metrics['eval/token_*'] (logged to wandb by _log_metrics)."""
-        # importing the dataloader module puts the repo root on sys.path (multi-cluster safe), so the
-        # shared token_metrics helper is importable; the module is already imported by build_dataloader.
-        from DiT4DiT.dataloader import sonic_token_dataset as _sd  # noqa: F401  (path side-effect)
+    def _sonic_token_metrics_on(self, loader):
+        """predict_action over a loader -> list of per-batch token_metrics dicts (main process only)."""
         from pi05_sonic_vla.eval.token_metrics import token_metrics
-
-        if not hasattr(self, "_sonic_eval_loader"):
-            self._sonic_eval_loader = self._build_sonic_eval_loader()
-
         accum = []
-        for examples in self._sonic_eval_loader:
+        for examples in loader:
             out = self.model.predict_action(examples=examples)
             if self.accelerator.is_main_process:
                 pred = np.asarray(out["normalized_actions"], np.float32)              # (B, H, D)
@@ -484,10 +479,26 @@ class VLATrainer(TrainerUtils):
                 mask = np.asarray([e["action_mask"] for e in examples], np.float32)   # (B, H, D)
                 valid = mask[..., 0] > 0.5                                            # (B, H)
                 accum.append(token_metrics(pred, gt, valid))
-        if self.accelerator.is_main_process and accum:
-            for k in (kk for kk in accum[0] if kk != "n_valid_tokens"):
-                step_metrics[f"eval/{k}"] = float(np.nanmean([a[k] for a in accum]))
-            step_metrics["eval/n_valid_tokens"] = int(sum(a["n_valid_tokens"] for a in accum))
+        return accum
+
+    def _eval_sonic_tokens(self, step_metrics):
+        """Token metrics (MSE/MAE/cos/fsq_top1 over valid tokens) on the held-out 'eval' split
+        (-> eval/token_*) AND an in-distribution 'train' sample (-> train/token_*). The train/eval
+        gap separates overfitting (train_cos >> eval_cos) from a conditioning ceiling (train ~= eval).
+        NOTE for the small-token scale: trust token_cos / fsq_top1, not MSE/MAE (FSQ tokens are tiny,
+        so a near-zero MSE can still be a large relative error)."""
+        # importing the dataloader module puts the repo root on sys.path (multi-cluster safe) so the
+        # shared token_metrics helper is importable.
+        from DiT4DiT.dataloader import sonic_token_dataset as _sd  # noqa: F401  (path side-effect)
+        if not hasattr(self, "_sonic_eval_loader"):
+            self._sonic_eval_loader = self._build_sonic_eval_loader("eval")
+            self._sonic_train_loader = self._build_sonic_eval_loader("train")
+        for prefix, loader in (("eval", self._sonic_eval_loader), ("train", self._sonic_train_loader)):
+            accum = self._sonic_token_metrics_on(loader)
+            if self.accelerator.is_main_process and accum:
+                for k in (kk for kk in accum[0] if kk != "n_valid_tokens"):
+                    step_metrics[f"{prefix}/{k}"] = float(np.nanmean([a[k] for a in accum]))
+                step_metrics[f"{prefix}/n_valid_tokens"] = int(sum(a["n_valid_tokens"] for a in accum))
         dist.barrier()
         return step_metrics
 
