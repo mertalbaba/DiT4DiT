@@ -307,6 +307,24 @@ class VLATrainer(TrainerUtils):
             state_dict = self.accelerator.get_state_dict(self.model)
             torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
 
+            # checkpoint rotation: keep only the rolling-latest (for resume) + every-`keep_every_steps`
+            # milestone (default 100k). DiT4DiT writes a ~21G consolidated model every save_interval
+            # with no rotation, which fills the disk; this caps it at ~(few)x21G.
+            import glob as _glob
+            import re as _re
+            _keep_every = int(getattr(self.config.trainer, "keep_every_steps", 100000))
+            for _fp in _glob.glob(os.path.join(self.checkpoint_dir, "steps_*_pytorch_model.pt")):
+                _m = _re.search(r"steps_(\d+)_pytorch_model\.pt$", os.path.basename(_fp))
+                if not _m:
+                    continue
+                _s = int(_m.group(1))
+                if _s == self.completed_steps or (_keep_every > 0 and _s % _keep_every == 0):
+                    continue
+                try:
+                    os.remove(_fp)
+                except OSError:
+                    pass
+
             # save training metadata
             summary_data = {
                 "steps": self.completed_steps,
