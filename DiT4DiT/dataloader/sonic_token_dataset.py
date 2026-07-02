@@ -50,7 +50,26 @@ from pi05_sonic_vla.data.sonic_token_dataset import (  # noqa: E402
     SonicTokenDataset,
     TARGET_FPS,
     TOKEN_DIM,
+    STATE_DIM,
+    default_corpora,
+    _load_state,
 )
+
+# Default 32-D state normalization: reuse the stats computed for the pi0.5 arm (byte-identical
+# proprio data). Quantile (q01/q99) -> [-1,1], matching the pi0.5 arm + GR00T min-max spirit.
+_STATE_STATS_DEFAULT = os.environ.get(
+    "SONIC_STATE_STATS",
+    f"{_REPO_ROOT}/openpi/assets/pi05_sonic_proprio/sonic_proprio/norm_stats.json")
+
+
+def _load_state_norm(path: str):
+    """Load (q01, q99) for the 32-D state from an openpi norm_stats.json; None if absent."""
+    try:
+        d = json.load(open(path))
+        s = d.get("norm_stats", d)["state"]
+        return np.asarray(s["q01"], np.float32), np.asarray(s["q99"], np.float32)
+    except Exception:
+        return None
 
 
 def _video_offsets(video_delta_indices, action_video_freq_ratio: int) -> list[int]:
@@ -69,14 +88,22 @@ class SonicVideoTokenDataset(SonicTokenDataset):
         corpora: list[CorpusSpec],
         video_delta_indices=(0, 12, 24, 36, 48),
         action_video_freq_ratio: int = 1,
+        use_state: bool = False,
+        state_stats_path: str | None = None,
         **kwargs,
     ):
         super().__init__(corpora, **kwargs)
         self.video_offsets = _video_offsets(video_delta_indices, action_video_freq_ratio)
         if not self.video_offsets:
             raise ValueError("video_delta_indices/action_video_freq_ratio produced 0 frames")
+        self.use_state = use_state
+        self._state_norm = (_load_state_norm(state_stats_path or _STATE_STATS_DEFAULT)
+                            if use_state else None)
+        if use_state and self._state_norm is None:
+            print(f"[SonicVideoTokenDataset] WARNING: use_state but no state stats at "
+                  f"{state_stats_path or _STATE_STATS_DEFAULT} -> emitting RAW state", flush=True)
         print(f"[SonicVideoTokenDataset] clip offsets (frames @ 50 Hz): {self.video_offsets} "
-              f"(cond=1, future={len(self.video_offsets) - 1})", flush=True)
+              f"(cond=1, future={len(self.video_offsets) - 1}); use_state={use_state}", flush=True)
 
     def _read_clip(self, rec, t: int) -> list[np.ndarray]:
         """Read frames at `t + offset` for every clip offset. Source-fps aware (Xperience)."""
@@ -129,7 +156,7 @@ class SonicVideoTokenDataset(SonicTokenDataset):
         # per-token validity -> (horizon, 64) mask the action DiT multiplies into its loss
         action_mask = np.repeat(valid.astype(np.float32)[:, None], TOKEN_DIM, axis=1)
 
-        return {
+        sample = {
             "image": frames,                          # list of (H, W, 3) uint8
             "lang": rec.instruction,
             "action": target.astype(np.float32),      # (horizon, 64) raw FSQ tokens
@@ -138,6 +165,13 @@ class SonicVideoTokenDataset(SonicTokenDataset):
             "episode_ref": rec.tokens_ref,
             "window_t": int(t),
         }
+        if self.use_state:
+            st = _load_state(rec, t)                   # (32,) raw q_dev+gravity (shared pi0.5 loader)
+            if self._state_norm is not None:          # quantile -> [-1,1] (reuse pi0.5 state stats)
+                q01, q99 = self._state_norm
+                st = np.clip(2.0 * (st - q01) / np.maximum(q99 - q01, 1e-6) - 1.0, -1.0, 1.0)
+            sample["state"] = st.astype(np.float32)   # (32,) -> projected into DiT cross-attn context
+        return sample
 
 
 def collate_fn(batch):
@@ -145,19 +179,10 @@ def collate_fn(batch):
     return batch
 
 
-def _corpora_from_env() -> list[CorpusSpec]:
-    """Same three corpora + env overrides as the pi0.5 arm (openpi SonicTokenDataConfig)."""
-    return [
-        CorpusSpec("leverb", "lerobot",
-                   os.environ.get("SONIC_LEVERB_ROOT",
-                                  "/ps/project/datasets/LeVERB_Bench/sonic_vla_50hz"), 1.0),
-        CorpusSpec("humanoid_everyday", "lerobot",
-                   os.environ.get("SONIC_HE_ROOT",
-                                  "/ps/project/datasets/humanoid_everyday/sonic_vla_50hz"), 1.0),
-        CorpusSpec("xperience", "xperience",
-                   os.environ.get("SONIC_XPERIENCE_ROOT",
-                                  "/ps/project/datasets/robo-xperience-10m"), 1.0),
-    ]
+def _corpora_from_env(weights=None) -> list[CorpusSpec]:
+    """The 5 SONIC corpora (VLA + proprio sidecars), shared with the pi0.5 arm via default_corpora
+    (HE-locomanip + PSI + UnifoLM + LeVERB + Xperience). `weights` = sampling mix (None -> default)."""
+    return default_corpora(weights)
 
 
 def get_sonic_vla_dataset(cfg, split_override=None, samples_per_epoch_override=None,
@@ -200,10 +225,14 @@ def get_sonic_vla_dataset(cfg, split_override=None, samples_per_epoch_override=N
     if index_dir:
         kwargs["cache_dir"] = index_dir
 
+    w = d.get("weights", None)
+    weights = {str(k): float(v) for k, v in dict(w).items()} if w else None
     return SonicVideoTokenDataset(
-        _corpora_from_env(),
+        _corpora_from_env(weights),
         video_delta_indices=list(d.get("video_delta_indices", (0, 12, 24, 36, 48))),
         action_video_freq_ratio=int(d.get("action_video_freq_ratio", 1)),
+        use_state=bool(d.get("include_state", False)),
+        state_stats_path=d.get("state_stats_path", None),
         **kwargs,
     )
 

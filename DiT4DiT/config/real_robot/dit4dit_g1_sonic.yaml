@@ -33,8 +33,9 @@ framework:
     add_pos_embed: True
     max_seq_len: 1024
     action_dim: 64                # SONIC FSQ token (was 36 raw upper-body joints)
-    state_dim: 0                  # fully latent -- no proprio (state_encoder disabled)
+    state_dim: 32                 # 32-D proprio (q_dev(29)+gravity(3)); projected into cross-attn context
     use_prev_tokens: true         # condition on prev-token history (projected into cross-attn context)
+    use_state: true               # condition on the current 32-D proprio state (mirrors prev_tokens)
     future_action_window_size: 49 # -> action_horizon 50 = the [50, 64] / 1 s SONIC chunk
     action_horizon: 50            # MUST equal future_action_window_size + 1 (head uses both)
     past_action_window_size: 0
@@ -58,7 +59,7 @@ framework:
 datasets:
   vla_data:
     dataset_py: sonic_token       # -> DiT4DiT/dataloader/sonic_token_dataset.py (bypasses GR00T loader)
-    include_state: false
+    include_state: true           # emit the 32-D proprio state (quantile-normalized, pi0.5 stats)
     default_image_resolution: [3, 224, 224]
     image_size: [224, 224]
     per_device_batch_size: 4      # 2B video backbone + clip; raise if memory allows
@@ -67,11 +68,11 @@ datasets:
     # backbone num_frames_out = len(range(0, len(video_delta_indices), action_video_freq_ratio)).
     video_delta_indices: [0, 12, 24, 36, 48]
     action_video_freq_ratio: 1    # -> 5 frames (1 cond + 4 future)
-    max_state_dim: 0
+    max_state_dim: 32
     max_action_dim: 64
     # token-dataset knobs (defaults mirror the pi0.5 arm's SonicTokenDataConfig)
-    history: 50                   # prev-token history length (TODO 3 consumes it)
-    history_stride: 4
+    history: 10                   # prev-token history length (4 s @ 0.4 s ticks = 10 tokens)
+    history_stride: 20            # 0.4 s spacing at 50 Hz
     history_dropout: 0.5
     min_valid_frac: 0.9
     samples_per_epoch: 200000
@@ -79,6 +80,9 @@ datasets:
     test_frac: 0.15               # match the pi05_sonic runs -> identical 134-episode held-out test (was 0.12 = stale)
     test_category: Locomanip
     train_exclude_corpora: []
+    # 5-corpus sampling mix (HE restricted to Locomanip; PSI + UnifoLM added; proprio sidecars).
+    # Set all to 0.2 for the uniform-mix ablation.
+    weights: {humanoid_everyday: 0.08, psi: 0.08, unifolm_wbt: 0.11, leverb: 0.08, xperience: 0.65}
 
 trainer:
   epochs: 100

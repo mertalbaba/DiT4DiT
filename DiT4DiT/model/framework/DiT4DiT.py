@@ -100,6 +100,14 @@ class DiT4DiT(baseframework):
                 nn.Linear(config.framework.action_model.action_dim, vl_hidden_dim)
                 if self.use_prev_tokens else None
             )
+            # Proprioception: project the 32-D state into ONE extra cross-attention context token
+            # (mirrors prev_tokens). Off by default so the original configs/data path are unaffected.
+            self.use_state = bool(config.framework.action_model.get("use_state", False))
+            _sdim = int(config.framework.action_model.get("state_dim", 0) or 0)
+            self.state_proj = (
+                nn.Linear(_sdim, vl_hidden_dim)
+                if (self.use_state and _sdim > 0) else None
+            )
         else:
             # Video-only mode: skip action model entirely
             self.action_model = None
@@ -107,6 +115,7 @@ class DiT4DiT(baseframework):
             self.past_action_window_size = 0
             self.chunk_len = 0
             self.prev_token_proj = None
+            self.state_proj = None
 
 
     def _append_prev_token_context(self, last_hidden, examples):
@@ -122,6 +131,19 @@ class DiT4DiT(baseframework):
             device=last_hidden.device, dtype=last_hidden.dtype,
         )  # (B, history, action_dim)
         return torch.cat([last_hidden, self.prev_token_proj(prev)], dim=1)
+
+    def _append_state_context(self, last_hidden, examples):
+        """Project the 32-D proprio state into one extra cross-attention context token (mirrors
+        _append_prev_token_context). No-op when disabled or examples carry no `state`."""
+        if last_hidden is None or getattr(self, "state_proj", None) is None:
+            return last_hidden
+        if not examples or "state" not in examples[0]:
+            return last_hidden
+        st = torch.tensor(
+            np.array([ex["state"] for ex in examples]),
+            device=last_hidden.device, dtype=last_hidden.dtype,
+        )  # (B, state_dim)
+        return torch.cat([last_hidden, self.state_proj(st)[:, None, :]], dim=1)
 
     def forward(
         self,
@@ -149,6 +171,7 @@ class DiT4DiT(baseframework):
             if not self.video_fm_only:
                 last_hidden = backbone_outputs.hidden_states[-1]  # [B, L, H] ##2560-4b
                 last_hidden = self._append_prev_token_context(last_hidden, examples)
+                last_hidden = self._append_state_context(last_hidden, examples)
             else:
                 last_hidden = None
             future_video_loss = getattr(backbone_outputs, "future_video_loss", None)
