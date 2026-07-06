@@ -170,7 +170,10 @@ class SonicVideoTokenDataset(SonicTokenDataset):
             if self._state_norm is not None:          # quantile -> [-1,1] (reuse pi0.5 state stats)
                 q01, q99 = self._state_norm
                 st = np.clip(2.0 * (st - q01) / np.maximum(q99 - q01, 1e-6) - 1.0, -1.0, 1.0)
-            sample["state"] = st.astype(np.float32)   # (32,) -> projected into DiT cross-attn context
+            # (1, 32): DiT4DiT.forward expects per-example state as [1, state_dim] (batches to
+            # [B, 1, state_dim]; its .repeat(r, 1, 1) needs the 3-D layout). ActionDiT's native
+            # state_encoder consumes it as one state token prepended to the action sequence.
+            sample["state"] = st.astype(np.float32)[None, :]
         return sample
 
 

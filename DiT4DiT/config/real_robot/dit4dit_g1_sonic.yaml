@@ -33,9 +33,11 @@ framework:
     add_pos_embed: True
     max_seq_len: 1024
     action_dim: 64                # SONIC FSQ token (was 36 raw upper-body joints)
-    state_dim: 32                 # 32-D proprio (q_dev(29)+gravity(3)); projected into cross-attn context
+    state_dim: 32                 # 32-D proprio (q_dev(29)+gravity(3)) -> ActionDiT's NATIVE state
+                                  # pathway (state_encoder -> one state token in the DiT sequence)
     use_prev_tokens: true         # condition on prev-token history (projected into cross-attn context)
-    use_state: true               # condition on the current 32-D proprio state (mirrors prev_tokens)
+    use_state: false              # extra cross-attn state token (redundant with the native pathway
+                                  # above -- keep off; state still flows via include_state+state_dim)
     future_action_window_size: 49 # -> action_horizon 50 = the [50, 64] / 1 s SONIC chunk
     action_horizon: 50            # MUST equal future_action_window_size + 1 (head uses both)
     past_action_window_size: 0
