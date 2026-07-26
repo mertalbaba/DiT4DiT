@@ -50,9 +50,11 @@ from pi05_sonic_vla.data.sonic_token_dataset import (  # noqa: E402
     SonicTokenDataset,
     TARGET_FPS,
     TOKEN_DIM,
+    HAND_TOKEN_DIM,
     STATE_DIM,
     default_corpora,
     _load_state,
+    _load_hand_window,
 )
 
 # Default 32-D state normalization: reuse the stats computed for the pi0.5 arm (byte-identical
@@ -148,19 +150,30 @@ class SonicVideoTokenDataset(SonicTokenDataset):
             )
         target, prev, valid, t = out
 
+        # body+hand mode (use_hand, inherited from the parent): concat the frame-aligned hand
+        # tokens -> (H, 128) = body(64) ++ hand(64).
+        hand_present = True
+        if self.use_hand:
+            hand, hand_present = _load_hand_window(rec, t, self.horizon)
+            target = np.concatenate([target, hand], axis=-1)
+
         # history dropout -> fight the copy-forward shortcut (same as the pi0.5 arm)
         if self._rng.random() < self.history_dropout:
             prev = np.zeros_like(prev)
 
         frames = self._read_clip(rec, t)
-        # per-token validity -> (horizon, 64) mask the action DiT multiplies into its loss
-        action_mask = np.repeat(valid.astype(np.float32)[:, None], TOKEN_DIM, axis=1)
+        # per-token validity -> (horizon, D) mask the action DiT multiplies into its loss.
+        # Hand-less corpora (LeVERB) get zeroed hand columns: ActionDiT's loss is
+        # sum(err*mask)/sum(mask), so those dims carry no loss and no gradient natively.
+        action_mask = np.repeat(valid.astype(np.float32)[:, None], target.shape[-1], axis=1)
+        if self.use_hand and not hand_present:
+            action_mask[:, TOKEN_DIM:] = 0.0
 
         sample = {
             "image": frames,                          # list of (H, W, 3) uint8
             "lang": rec.instruction,
-            "action": target.astype(np.float32),      # (horizon, 64) raw FSQ tokens
-            "action_mask": action_mask,               # (horizon, 64)
+            "action": target.astype(np.float32),      # (horizon, 64|128) raw FSQ tokens (bh: ++hand)
+            "action_mask": action_mask,               # (horizon, same D; hand cols 0 when no hands)
             "prev_tokens": prev.astype(np.float32),    # (history, 64) -- TODO 3 consumes this
             "episode_ref": rec.tokens_ref,
             "window_t": int(t),
@@ -223,6 +236,7 @@ def get_sonic_vla_dataset(cfg, split_override=None, samples_per_epoch_override=N
         test_frac=float(d.get("test_frac", 0.12)),
         test_category=str(d.get("test_category", "Locomanip")),
         train_exclude_corpora=tuple(d.get("train_exclude_corpora", ()) or ()),
+        use_hand=bool(d.get("use_hand", False)),
     )
     index_dir = os.environ.get("SONIC_INDEX_DIR")
     if index_dir:

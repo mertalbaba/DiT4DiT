@@ -1,0 +1,125 @@
+# DiT4DiT-SONIC BODY+HAND (bh): action = [50, 128] = body SONIC(64) ++ hand SONIC(64), single
+# flow head, NOHIST baked in (both token families encode ~1 s of FUTURE motion -> prev-token
+# conditioning leaks the target; see readme_sonic.md + pi05_sonic_vla/DEPLOY.md).
+# LeVERB has no hand tokens: its hand dims get a zero action_mask -> zero loss/gradient
+# (ActionDiT's loss is sum(err*mask)/sum(mask), natively per-dim).
+# Deltas vs dit4dit_g1_sonic.yaml: action_dim/max_action_dim 64->128, use_hand: true,
+# use_prev_tokens: false + history: 0 (nohist), uniform 0.2 mix (matches the pi0.5 bh phase-2
+# arm; for an Anna-style phase 1 override weights + train_exclude_corpora on the CLI).
+run_id: dit4dit_sonic_bh
+run_root_dir: results/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: rlforimitation
+wandb_project: humanoid-vla
+is_debug: false
+
+framework:
+  name: DiT4DiT
+  cosmos25:
+    future_num_inference_steps: 1
+    future_loss_type: flow_matching
+    extract_layer: 17
+    base_model: /fast/malbaba/hfcache/Cosmos-Predict2.5-2B
+    attn_implementation: sdpa
+    vl_hidden_dim: 2048
+    training: joint                              # joint = action_loss + future_video_loss
+    flow_matching:
+      time_distribution: logit_normal
+      high_sigma_ratio: 0.05
+      high_sigma_min: 0.98
+    conditional_frame_timestep: 0.0001
+
+  action_model:
+    action_model_type: DiT-B
+    hidden_size: 2560
+    add_pos_embed: True
+    max_seq_len: 1024
+    action_dim: 128               # body SONIC(64) ++ hand SONIC(64)
+    state_dim: 32                 # 32-D proprio (q_dev(29)+gravity(3)) -> ActionDiT's NATIVE state
+                                  # pathway (state_encoder -> one state token in the DiT sequence)
+    use_prev_tokens: false        # NOHIST (leak-free); no prev-token cross-attn context
+    use_state: false              # extra cross-attn state token (redundant with the native pathway
+                                  # above -- keep off; state still flows via include_state+state_dim)
+    future_action_window_size: 49 # -> action_horizon 50 = the [50, 128] / 1 s chunk
+    action_horizon: 50            # MUST equal future_action_window_size + 1 (head uses both)
+    past_action_window_size: 0
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 10   # inference-only flow Euler steps (training is continuous-time)
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048   # Cosmos hidden dim (vl_hidden_dim)
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      output_dim: 2560
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: sonic_token       # -> DiT4DiT/dataloader/sonic_token_dataset.py (bypasses GR00T loader)
+    include_state: true           # emit the 32-D proprio state (quantile-normalized, pi0.5 stats)
+    use_hand: true                # -> targets (50, 128) + per-dim action_mask (LeVERB hand dims 0)
+    default_image_resolution: [3, 224, 224]
+    image_size: [224, 224]
+    per_device_batch_size: 4
+    num_workers: 4
+    # video FM clip: cond frame 0 + future frames; offsets span ~1 s to match the token window.
+    video_delta_indices: [0, 12, 24, 36, 48]
+    action_video_freq_ratio: 1    # -> 5 frames (1 cond + 4 future)
+    max_state_dim: 32
+    max_action_dim: 128
+    # NOHIST: no prev-token history anywhere (matches use_prev_tokens: false above).
+    history: 0
+    history_stride: 20
+    history_dropout: 0.0
+    min_valid_frac: 0.9
+    samples_per_epoch: 200000
+    split: train                  # held out: ~5% HE eval + Locomanip test_locomotion
+    test_frac: 0.15               # identical held-out sets to every other sonic run
+    test_category: Locomanip
+    train_exclude_corpora: []
+    # uniform 5-corpus mix (matches the pi0.5 bh phase-2 arm). Anna-style phase 1 = override:
+    #   --datasets.vla_data.train_exclude_corpora='[humanoid_everyday,psi,unifolm_wbt,leverb]'
+    weights: {humanoid_everyday: 0.2, psi: 0.2, unifolm_wbt: 0.2, leverb: 0.2, xperience: 0.2}
+
+trainer:
+  epochs: 100
+  max_train_steps: 200000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  eval_interval: 500
+  eval_batches: 8          # held-out HE eval batches -> wandb eval/token_{mse,mae,cos},fsq_top1
+  learning_rate:
+    base: 1e-05
+    backbone_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ''
+  repeated_diffusion_steps: 4
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true
