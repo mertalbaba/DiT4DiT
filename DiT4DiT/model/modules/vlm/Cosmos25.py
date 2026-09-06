@@ -158,10 +158,13 @@ class Cosmos25FeatureExtractor(nn.Module):
         def hook_fn(module, inp, out):
             if not getattr(self, "_capture_hidden_enabled", True):
                 return
+            # detach_capture=False keeps the graph so the ACTION loss can update the
+            # backbone through the extraction point (0905 joint recipe); True = old probe mode.
+            keep = getattr(self, "detach_capture", True)
             if torch.is_tensor(out):
-                self._cached_hidden.append(out.detach())
+                self._cached_hidden.append(out.detach() if keep else out)
             elif isinstance(out, (tuple, list)) and len(out) > 0 and torch.is_tensor(out[0]):
-                self._cached_hidden.append(out[0].detach())
+                self._cached_hidden.append(out[0].detach() if keep else out[0])
 
         self._hook_handle = target_layer.register_forward_hook(hook_fn)
 
@@ -876,6 +879,9 @@ class _Cosmos25_Interface(nn.Module):
         self.revision = cosmos_cfg.get("revision", "diffusers/base/post-trained")
         self.local_files_only = bool(cosmos_cfg.get("local_files_only", True))
         self.trainable = bool(cosmos_cfg.get("trainable", False))
+        # 0905: false (default) = action gradients flow into the backbone (joint, GR-2-style);
+        # true = legacy behavior, head probes features the action loss cannot shape.
+        self.detach_backbone = bool(cosmos_cfg.get("detach_backbone", False))
 
         dtype_str = cosmos_cfg.get("torch_dtype", "bfloat16")
         torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}.get(
@@ -893,6 +899,7 @@ class _Cosmos25_Interface(nn.Module):
             device=cosmos_cfg.get("device", None),
             config=config,
         )
+        self.extractor.detach_capture = self.detach_backbone
 
         # Try to set vl_hidden_dim in config if missing
         if config is not None and getattr(config.framework.cosmos25, "vl_hidden_dim", None) in (None, 0):
@@ -1059,7 +1066,7 @@ class _Cosmos25_Interface(nn.Module):
                 videos=videos,
                 height=height,
                 width=width,
-                detach=True,
+                detach=self.detach_backbone,
                 gt_future_videos=future_videos,
                 return_pred_future_video=False,
                 num_inference_steps=future_steps,
@@ -1072,7 +1079,7 @@ class _Cosmos25_Interface(nn.Module):
                 videos=videos,
                 height=height,
                 width=width,
-                detach=True,
+                detach=self.detach_backbone,
                 num_frames_out=train_num_frames_out,
                 conditional_frame_timestep=conditional_frame_timestep,
             )

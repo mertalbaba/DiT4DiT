@@ -66,6 +66,9 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"):
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
             num_workers=int(cfg.datasets.vla_data.get("num_workers", 4)),
+            # 0905: without this every worker forks the same RNG -> batches arrive in runs of
+            # num_workers duplicates (~1/4 unique data; ALL Jun-Jul dit4dit runs affected).
+            worker_init_fn=vla_dataset._reseed_worker,
         )
         if (not dist.is_initialized()) or dist.get_rank() == 0:
             save_identity_statistics(Path(cfg.output_dir) / "dataset_statistics.json")

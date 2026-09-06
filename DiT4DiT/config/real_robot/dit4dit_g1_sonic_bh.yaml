@@ -20,7 +20,7 @@ framework:
     future_num_inference_steps: 1
     future_loss_type: flow_matching
     extract_layer: 17
-    base_model: /fast/malbaba/hfcache/Cosmos-Predict2.5-2B
+    base_model: /home/mealbaba/hfcache/Cosmos-Predict2.5-2B
     attn_implementation: sdpa
     vl_hidden_dim: 2048
     training: joint                              # joint = action_loss + future_video_loss
@@ -87,7 +87,7 @@ datasets:
     train_exclude_corpora: []
     # uniform 5-corpus mix (matches the pi0.5 bh phase-2 arm). Anna-style phase 1 = override:
     #   --datasets.vla_data.train_exclude_corpora='[humanoid_everyday,psi,unifolm_wbt,leverb]'
-    weights: {humanoid_everyday: 0.2, psi: 0.2, unifolm_wbt: 0.2, leverb: 0.2, xperience: 0.2}
+    weights: {humanoid_everyday: 0.2, psi: 0.2, unifolm_wbt: 0.2, leverb: 0.2, egosuite: 0.2}
 
 trainer:
   epochs: 100

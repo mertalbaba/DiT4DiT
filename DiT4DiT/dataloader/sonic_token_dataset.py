@@ -132,6 +132,7 @@ class SonicVideoTokenDataset(SonicTokenDataset):
         return frames
 
     def __getitem__(self, _idx):
+        self._maybe_anneal()   # 0905: bhs5-parity linear-in-samples mix anneal (no-op without weights_end)
         # episode + window rejection sampling (identical policy to the parent loader)
         out = None
         for _ in range(self.max_resample):
@@ -195,10 +196,18 @@ def collate_fn(batch):
     return batch
 
 
-def _corpora_from_env(weights=None) -> list[CorpusSpec]:
-    """The 5 SONIC corpora (VLA + proprio sidecars), shared with the pi0.5 arm via default_corpora
-    (HE-locomanip + PSI + UnifoLM + LeVERB + Xperience). `weights` = sampling mix (None -> default)."""
-    return default_corpora(weights)
+def _corpora_from_env(weights=None, he_all_categories=False) -> list[CorpusSpec]:
+    """The SONIC corpora (VLA + proprio sidecars), shared with the pi0.5 arm via default_corpora.
+    `weights` = sampling mix (None -> default); an `egosuite`/`xperience` key opts that corpus in.
+
+    0905: mark every robot corpus q_order="isaac" (the pi0.5 arm's fix_state_order): all proprio
+    sidecars store q_dev in IsaacLab order, and without the remap the state was served scrambled
+    vs the SONIC-grouped order deploy sends -- one of the root causes of the 0714 stand-still."""
+    import dataclasses
+    corpora = default_corpora(weights,
+                              he_category_filter=None if he_all_categories else "Locomanip")
+    return [dataclasses.replace(c, q_order="isaac") if c.q_order != "isaac" else c
+            for c in corpora]
 
 
 def get_sonic_vla_dataset(cfg, split_override=None, samples_per_epoch_override=None,
@@ -238,6 +247,11 @@ def get_sonic_vla_dataset(cfg, split_override=None, samples_per_epoch_override=N
         train_exclude_corpora=tuple(d.get("train_exclude_corpora", ()) or ()),
         use_hand=bool(d.get("use_hand", False)),
     )
+    # 0905 bhs5-parity: linear-in-samples mix anneal (needs _maybe_anneal() in __getitem__).
+    we = d.get("weights_end", None)
+    if we:
+        kwargs["weights_end"] = {str(k): float(v) for k, v in dict(we).items()}
+        kwargs["mix_anneal_samples"] = int(d.get("mix_anneal_samples", 12_800_000))
     index_dir = os.environ.get("SONIC_INDEX_DIR")
     if index_dir:
         kwargs["cache_dir"] = index_dir
@@ -245,7 +259,7 @@ def get_sonic_vla_dataset(cfg, split_override=None, samples_per_epoch_override=N
     w = d.get("weights", None)
     weights = {str(k): float(v) for k, v in dict(w).items()} if w else None
     return SonicVideoTokenDataset(
-        _corpora_from_env(weights),
+        _corpora_from_env(weights, he_all_categories=bool(d.get("he_all_categories", False))),
         video_delta_indices=list(d.get("video_delta_indices", (0, 12, 24, 36, 48))),
         action_video_freq_ratio=int(d.get("action_video_freq_ratio", 1)),
         use_state=bool(d.get("include_state", False)),

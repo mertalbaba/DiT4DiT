@@ -264,10 +264,18 @@ class DiT4DiT(baseframework):
             last_hidden = self._append_prev_token_context(last_hidden, examples)
 
         state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
-        
+
+        # RTC serving (0905): "rtc_prefix" = (d, action_dim) actions already committed/executing;
+        # the head pins those rows (tau=0) through the whole integration, matching training.
+        rtc_prefix = None
+        if "rtc_prefix" in examples[0] and examples[0]["rtc_prefix"] is not None:
+            rtc_prefix = torch.from_numpy(np.array([ex["rtc_prefix"] for ex in examples])).to(
+                last_hidden.device, dtype=last_hidden.dtype)
+
         # Step 4: Action Expert Forward
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(last_hidden, state)  # (B, chunk_len, action_dim)
+            pred_actions = self.action_model.predict_action(last_hidden, state,
+                                                            rtc_prefix=rtc_prefix)  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}

@@ -17,10 +17,13 @@ framework:
     future_num_inference_steps: 1
     future_loss_type: flow_matching
     extract_layer: 17
-    base_model: /fast/malbaba/hfcache/Cosmos-Predict2.5-2B
+    base_model: /home/mealbaba/hfcache/Cosmos-Predict2.5-2B
     attn_implementation: sdpa             # B200 sdpa already uses fused/flash kernels; flash-attn sm_100 build is fragile (override via ATTN=flash_attention_2)
     vl_hidden_dim: 2048
     training: joint                              # joint = action_loss + future_video_loss
+    detach_backbone: false        # 0905: action gradients DO reach the backbone (GR-2-style
+                                  # joint recipe; video FM loss stays as the regularizer).
+                                  # true = old behavior (head probes frozen-wrt-action features).
     flow_matching:
       time_distribution: logit_normal
       high_sigma_ratio: 0.05
@@ -29,13 +32,20 @@ framework:
 
   action_model:
     action_model_type: DiT-B
+    rtc_max_delay: 16             # 0905: training-time RTC over the full run (uniform delay,
+                                  # frozen clean prefix rows tau=0 + loss-masked) -- matches
+                                  # the pi0.5 bhs5 mainline and the serving contract.
     hidden_size: 2560
     add_pos_embed: True
     max_seq_len: 1024
     action_dim: 64                # SONIC FSQ token (was 36 raw upper-body joints)
     state_dim: 32                 # 32-D proprio (q_dev(29)+gravity(3)) -> ActionDiT's NATIVE state
                                   # pathway (state_encoder -> one state token in the DiT sequence)
-    use_prev_tokens: true         # condition on prev-token history (projected into cross-attn context)
+    use_prev_tokens: false        # 0905: OFF. SONIC tokens encode ~1s of FUTURE motion; at the
+                                  # 0.4s history lag this leaked 60-92% of the target (copy-forward
+                                  # training -> stand-still attractor at deployment, the 0706 run's
+                                  # failure). No >=1s-lag knob exists in the loader; nohist is the
+                                  # validated setting (pi0.5 arm, closed-loop confirmed 0716).
     use_state: false              # extra cross-attn state token (redundant with the native pathway
                                   # above -- keep off; state still flows via include_state+state_dim)
     future_action_window_size: 49 # -> action_horizon 50 = the [50, 64] / 1 s SONIC chunk
@@ -73,7 +83,7 @@ datasets:
     max_state_dim: 32
     max_action_dim: 64
     # token-dataset knobs (defaults mirror the pi0.5 arm's SonicTokenDataConfig)
-    history: 10                   # prev-token history length (4 s @ 0.4 s ticks = 10 tokens)
+    history: 0                    # 0905: no prev-token history (see use_prev_tokens note)
     history_stride: 20            # 0.4 s spacing at 50 Hz
     history_dropout: 0.5
     min_valid_frac: 0.9
@@ -82,9 +92,13 @@ datasets:
     test_frac: 0.15               # match the pi05_sonic runs -> identical 134-episode held-out test (was 0.12 = stale)
     test_category: Locomanip
     train_exclude_corpora: []
-    # 5-corpus sampling mix (HE restricted to Locomanip; PSI + UnifoLM added; proprio sidecars).
-    # Set all to 0.2 for the uniform-mix ablation.
-    weights: {humanoid_everyday: 0.08, psi: 0.08, unifolm_wbt: 0.11, leverb: 0.08, xperience: 0.65}
+    # 5-corpus sampling mix (proprio sidecars). 0905: EXACT bhs5-mainline recipe -- EgoSuite
+    # in the human slot, same start/end weights, same linear-in-SAMPLES anneal, ALL HE
+    # categories (was Locomanip-only). Set all weights to 0.2 for the uniform-mix ablation.
+    he_all_categories: true
+    weights: {humanoid_everyday: 0.08, psi: 0.08, unifolm_wbt: 0.08, leverb: 0.08, egosuite: 0.68}
+    weights_end: {humanoid_everyday: 0.25, psi: 0.25, unifolm_wbt: 0.2, leverb: 0.1, egosuite: 0.2}
+    mix_anneal_samples: 12800000
 
 trainer:
   epochs: 100

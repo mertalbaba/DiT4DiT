@@ -483,7 +483,8 @@ class VLATrainer(TrainerUtils):
             samples_per_epoch_override=max(n_batches * bs, bs),
             history_dropout_override=0.0,
         )
-        return DataLoader(ds, batch_size=bs, collate_fn=collate_fn, num_workers=2)
+        return DataLoader(ds, batch_size=bs, collate_fn=collate_fn, num_workers=2,
+                          worker_init_fn=ds._reseed_worker)  # 0905: no duplicate eval samples
 
     def _sonic_token_metrics_on(self, loader):
         """predict_action over a loader -> list of per-batch token_metrics dicts (main process only)."""

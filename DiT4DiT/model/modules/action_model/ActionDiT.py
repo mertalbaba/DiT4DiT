@@ -79,15 +79,13 @@ class ActionEncoder(nn.Module):
         """
         B, T, _ = actions.shape
 
-        # 1) Expand each batch's single scalar time 'tau' across all T steps
-        #    so that shape => (B, T)
-        #    e.g. if timesteps is (B,), replicate across T
+        # 1) Per-token time 'tau': accept (B,) (replicated across T) or an explicit (B, T)
+        #    per-row schedule (training-time RTC: frozen prefix rows carry tau=0/clean).
         if timesteps.dim() == 1 and timesteps.shape[0] == B:
-            # shape (B,) => (B,T)
             timesteps = timesteps.unsqueeze(1).expand(-1, T)
-        else:
+        elif timesteps.dim() != 2 or tuple(timesteps.shape) != (B, T):
             raise ValueError(
-                "Expected `timesteps` to have shape (B,) so we can replicate across T."
+                "Expected `timesteps` of shape (B,) or (B, T)."
             )
 
         # 2) Standard action MLP step for shape => (B, T, w)
@@ -127,15 +125,13 @@ class MultiEmbodimentActionEncoder(nn.Module):
         """
         B, T, _ = actions.shape
 
-        # 1) Expand each batch's single scalar time 'tau' across all T steps
-        #    so that shape => (B, T)
-        #    e.g. if timesteps is (B,), replicate across T
+        # 1) Per-token time 'tau': accept (B,) (replicated across T) or an explicit (B, T)
+        #    per-row schedule (training-time RTC: frozen prefix rows carry tau=0/clean).
         if timesteps.dim() == 1 and timesteps.shape[0] == B:
-            # shape (B,) => (B,T)
             timesteps = timesteps.unsqueeze(1).expand(-1, T)
-        else:
+        elif timesteps.dim() != 2 or tuple(timesteps.shape) != (B, T):
             raise ValueError(
-                "Expected `timesteps` to have shape (B,) so we can replicate across T."
+                "Expected `timesteps` of shape (B,) or (B, T)."
             )
 
         # 2) Standard action MLP step for shape => (B, T, w)
@@ -255,6 +251,9 @@ class FlowmatchingActionHead(nn.Module):
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
+        # Training-time RTC (0905, ported from the pi0.5 arm): uniform delay d in [0, max],
+        # prefix rows frozen to clean GT (tau=0) and loss-masked; 0 = off.
+        self.rtc_max_delay = int(config.get("rtc_max_delay", 0) or 0)
         self.config = config
 
     def sample_time(self, batch_size, device, dtype):
@@ -282,7 +281,21 @@ class FlowmatchingActionHead(nn.Module):
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        action_features = self.action_encoder(noisy_trajectory, t_discretized)
+
+        # Training-time RTC: freeze the first d rows to CLEAN GT (t=0 in this convention),
+        # give them tau=0 in the per-token time channel, and mask them out of the loss --
+        # the model learns to complete a chunk whose prefix is already committed/executing.
+        if self.rtc_max_delay > 0:
+            B, H = actions.shape[0], actions.shape[1]
+            d = torch.randint(0, self.rtc_max_delay + 1, (B,), device=device)
+            frozen = torch.arange(H, device=device)[None, :] < d[:, None]        # (B, H)
+            noisy_trajectory = torch.where(frozen[..., None], actions, noisy_trajectory)
+            per_row_t = t_discretized[:, None].expand(B, H).clone()
+            per_row_t = per_row_t.masked_fill(frozen, 0)
+            action_mask = action_mask * (~frozen[..., None]).to(action_mask.dtype)
+            action_features = self.action_encoder(noisy_trajectory, per_row_t)
+        else:
+            action_features = self.action_encoder(noisy_trajectory, t_discretized)
 
 
         # embed state
@@ -318,7 +331,11 @@ class FlowmatchingActionHead(nn.Module):
         return loss
 
     @torch.no_grad()
-    def predict_action(self, vl_embs: torch.Tensor, state: torch.Tensor = None) -> torch.Tensor:
+    def predict_action(self, vl_embs: torch.Tensor, state: torch.Tensor = None,
+                       rtc_prefix: torch.Tensor = None) -> torch.Tensor:
+        """rtc_prefix: (d, action_dim) or (B, d, action_dim) already-committed actions for
+        RTC serving -- rows [0:d] are pinned to it (tau=0) throughout the integration, so the
+        model completes the chunk exactly as it was trained to (rtc_max_delay > 0)."""
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
@@ -327,10 +344,18 @@ class FlowmatchingActionHead(nn.Module):
             dtype=vl_embs.dtype,
             device=device,
         )
+        H = self.config.action_horizon
+        d = 0
+        if rtc_prefix is not None and len(rtc_prefix) > 0:
+            if rtc_prefix.dim() == 2:
+                rtc_prefix = rtc_prefix[None].expand(batch_size, -1, -1)
+            d = min(int(rtc_prefix.shape[1]), H)
+            rtc_prefix = rtc_prefix[:, :d].to(device=device, dtype=actions.dtype)
+            actions[:, :d] = rtc_prefix
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
-        
+
         state_features = self.state_encoder(state) if state is not None else None
 
         # Run denoising steps (t goes from 1 -> 0, i.e. noise -> clean).
@@ -342,7 +367,12 @@ class FlowmatchingActionHead(nn.Module):
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            action_features = self.action_encoder(actions, timesteps_tensor)
+            enc_timesteps = timesteps_tensor
+            if d > 0:  # pinned prefix rows carry tau=0 (clean), matching training-time RTC;
+                       # the DiT's global adaLN timestep stays the scalar suffix time.
+                enc_timesteps = timesteps_tensor[:, None].expand(batch_size, H).clone()
+                enc_timesteps[:, :d] = 0
+            action_features = self.action_encoder(actions, enc_timesteps)
             # Maybe add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -366,6 +396,8 @@ class FlowmatchingActionHead(nn.Module):
 
             # Update actions using euler integration (stepping from noise toward clean).
             actions = actions - dt * pred_velocity
+            if d > 0:
+                actions[:, :d] = rtc_prefix           # re-pin the committed prefix
         return actions
 
     @property
