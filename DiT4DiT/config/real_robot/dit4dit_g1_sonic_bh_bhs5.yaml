@@ -1,0 +1,140 @@
+# DiT4DiT-SONIC BODY+HAND, NON-RTC, bhs5 mix (0911). The fair dit4dit-vs-pi0.5 comparison arm:
+# action = [50, 128] = body SONIC(64) ++ hand SONIC(64) (matches pi0.5 bhs5/bhs6), the EXACT
+# bhs5 5-corpus mix + anneal, and training-time RTC OFF (rtc_max_delay: 0) to match the non-RTC
+# pi0.5 arm. Derived from dit4dit_g1_sonic.yaml (the 64-d body-only RTC mainline) with ONLY:
+# action_dim/max_action_dim 64->128, use_hand: true, rtc_max_delay 16->0. Everything else
+# (backbone, LR, 200k schedule, splits, state) is byte-identical -> only RTC and the hand head
+# differ from the RTC run. Eval logs eval/token_cos{,_body,_hand} + fsq_top1{,_body,_hand}.
+run_id: dit4dit_sonic_bh_nortc
+run_root_dir: results/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: rlforimitation
+wandb_project: humanoid-vla
+is_debug: false
+
+framework:
+  name: DiT4DiT
+  cosmos25:
+    future_num_inference_steps: 1
+    future_loss_type: flow_matching
+    extract_layer: 17
+    base_model: /home/mealbaba/hfcache/Cosmos-Predict2.5-2B
+    attn_implementation: sdpa             # B200 sdpa already uses fused/flash kernels; flash-attn sm_100 build is fragile (override via ATTN=flash_attention_2)
+    vl_hidden_dim: 2048
+    training: joint                              # joint = action_loss + future_video_loss
+    detach_backbone: false        # 0905: action gradients DO reach the backbone (GR-2-style
+                                  # joint recipe; video FM loss stays as the regularizer).
+                                  # true = old behavior (head probes frozen-wrt-action features).
+    flow_matching:
+      time_distribution: logit_normal
+      high_sigma_ratio: 0.05
+      high_sigma_min: 0.98
+    conditional_frame_timestep: 0.0001
+
+  action_model:
+    action_model_type: DiT-B
+    rtc_max_delay: 0              # NON-RTC 128-d run (0911): training-time RTC OFF for the fair
+                                  # dit4dit-vs-pi0.5 comparison (matches the non-RTC pi0.5 arm).
+                                  # ActionDiT gates the whole RTC branch on rtc_max_delay > 0.
+    hidden_size: 2560
+    add_pos_embed: True
+    max_seq_len: 1024
+    action_dim: 128               # body SONIC(64) ++ hand SONIC(64) -- matches pi0.5 (bhs5/bhs6)
+    state_dim: 32                 # 32-D proprio (q_dev(29)+gravity(3)) -> ActionDiT's NATIVE state
+                                  # pathway (state_encoder -> one state token in the DiT sequence)
+    use_prev_tokens: false        # 0905: OFF. SONIC tokens encode ~1s of FUTURE motion; at the
+                                  # 0.4s history lag this leaked 60-92% of the target (copy-forward
+                                  # training -> stand-still attractor at deployment, the 0706 run's
+                                  # failure). No >=1s-lag knob exists in the loader; nohist is the
+                                  # validated setting (pi0.5 arm, closed-loop confirmed 0716).
+    use_state: false              # extra cross-attn state token (redundant with the native pathway
+                                  # above -- keep off; state still flows via include_state+state_dim)
+    future_action_window_size: 49 # -> action_horizon 50 = the [50, 64] / 1 s SONIC chunk
+    action_horizon: 50            # MUST equal future_action_window_size + 1 (head uses both)
+    past_action_window_size: 0
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 10   # inference-only flow Euler steps (training is continuous-time). Matched to pi0.5 for an apples-to-apples token-cos comparison. (4 under-sampled -> eval floored ~0.6.)
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048   # Cosmos hidden dim (vl_hidden_dim)
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      output_dim: 2560
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: sonic_token       # -> DiT4DiT/dataloader/sonic_token_dataset.py (bypasses GR00T loader)
+    include_state: true           # emit the 32-D proprio state (quantile-normalized, pi0.5 stats)
+    use_hand: true                # targets (50,128) = body(64) ++ hand(64) + per-dim action_mask
+                                  # (LeVERB hand dims -> 0 loss/grad, ActionDiT loss is per-dim)
+    default_image_resolution: [3, 224, 224]
+    image_size: [224, 224]
+    per_device_batch_size: 4      # 2B video backbone + clip; raise if memory allows
+    num_workers: 4
+    # video FM clip: cond frame 0 + future frames; offsets span ~1 s to match the token window.
+    # backbone num_frames_out = len(range(0, len(video_delta_indices), action_video_freq_ratio)).
+    video_delta_indices: [0, 12, 24, 36, 48]
+    action_video_freq_ratio: 1    # -> 5 frames (1 cond + 4 future)
+    max_state_dim: 32
+    max_action_dim: 128
+    # token-dataset knobs (defaults mirror the pi0.5 arm's SonicTokenDataConfig)
+    history: 0                    # 0905: no prev-token history (see use_prev_tokens note)
+    history_stride: 20            # 0.4 s spacing at 50 Hz
+    history_dropout: 0.5
+    min_valid_frac: 0.9
+    samples_per_epoch: 200000
+    split: train                  # held out: ~5% HE eval + Locomanip test_locomotion
+    test_frac: 0.15               # match the pi05_sonic runs -> identical 134-episode held-out test (was 0.12 = stale)
+    test_category: Locomanip
+    train_exclude_corpora: []
+    # 5-corpus sampling mix (proprio sidecars). 0905: EXACT bhs5-mainline recipe -- EgoSuite
+    # in the human slot, same start/end weights, same linear-in-SAMPLES anneal, ALL HE
+    # categories (was Locomanip-only). Set all weights to 0.2 for the uniform-mix ablation.
+    he_all_categories: true
+    weights: {humanoid_everyday: 0.08, psi: 0.08, unifolm_wbt: 0.08, leverb: 0.08, egosuite: 0.68}
+    weights_end: {humanoid_everyday: 0.25, psi: 0.25, unifolm_wbt: 0.2, leverb: 0.1, egosuite: 0.2}
+    mix_anneal_samples: 12800000
+
+trainer:
+  epochs: 100
+  max_train_steps: 200000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  eval_interval: 500
+  eval_batches: 8          # held-out HE eval batches -> wandb eval/token_{mse,mae,cos},fsq_top1
+  learning_rate:
+    base: 1e-05
+    backbone_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ''
+  repeated_diffusion_steps: 4
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true

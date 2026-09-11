@@ -497,7 +497,13 @@ class VLATrainer(TrainerUtils):
                 gt = np.asarray([e["action"] for e in examples], np.float32)          # (B, H, D)
                 mask = np.asarray([e["action_mask"] for e in examples], np.float32)   # (B, H, D)
                 valid = mask[..., 0] > 0.5                                            # (B, H)
-                accum.append(token_metrics(pred, gt, valid))
+                # body+hand runs (D==128): log token_*_body / token_*_hand separately via the
+                # per-(t,dim) mask + slice groups. Body-only (D==64) leaves the extra keys off.
+                d = pred.shape[-1]
+                groups = {"body": (0, 64), "hand": (64, 128)} if d >= 128 else None
+                accum.append(token_metrics(pred, gt, valid,
+                                           dim_valid=(mask > 0.5) if groups else None,
+                                           groups=groups))
         return accum
 
     def _eval_sonic_tokens(self, step_metrics):
