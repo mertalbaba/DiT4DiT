@@ -1,0 +1,149 @@
+# DiT4DiT-SONIC BODY+HAND, RTC FINE-TUNE of the 100k NON-RTC base (0917). The dit4dit analog of
+# the pi0.5 RTC ft (pi05_sonic_bhs6_rtcft): take the finished non-RTC 128-d base and turn ON
+# training-time RTC for a short fine-tune so the model learns to complete a committed/executing
+# chunk prefix (the prefix-pinning skill inference-time RTC alone can't deliver).
+#
+# Derived from dit4dit_g1_sonic_bh_bhs5.yaml (0922, the 46-D proprio base) with ONLY:
+#   - rtc_max_delay 0 -> 16                     (RTC ON; same ceiling as the pi0.5 arm)
+#   - trainer.pretrained_checkpoint = the prop_0920 100k non-RTC ckpt + is_resume:false
+#                                                (WEIGHT-INIT ft: completed_steps=0, fresh optim/step;
+#                                                 load is strict=False + shape-filtered, and the RTC
+#                                                 branch adds NO new params -> all tensors load clean)
+#   - state_dim/max_state_dim 46, include_hand_proprio:true, include_hand_state:false, 46-D stats
+#                                                (MUST match the base or the state_encoder re-inits)
+#   - max_train_steps 150k -> 20000, num_warmup_steps 5000 -> 500   (short ft)
+#   - LR halved to 5e-6 / 5e-5   (mirrors pi0.5 ft = half the mainline peak: 1e-4 -> 5e-5)
+#   - uniform 0.2 mix, no anneal (weights == weights_end)
+#   - keep_every_steps 10000     (rotation keeps 10k + 20k milestones + rolling latest)
+# NB the prop_0920 base IS fully mix-annealed (mix_anneal_samples 2.5M reached the uniform 0.2 end
+# mix by ~78k of its 100k steps), so this uniform-0.2 ft is same-distribution -- no mismatch with the
+# base's final mix, unlike the old 0917 base which was only ~25% annealed.
+run_id: dit4dit_sonic_bh_rtcft
+run_root_dir: results/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: rlforimitation
+wandb_project: humanoid-vla
+is_debug: false
+
+framework:
+  name: DiT4DiT
+  cosmos25:
+    future_num_inference_steps: 1
+    future_loss_type: flow_matching
+    extract_layer: 17
+    base_model: /home/mealbaba/hfcache/Cosmos-Predict2.5-2B
+    attn_implementation: sdpa
+    vl_hidden_dim: 2048
+    training: joint
+    detach_backbone: false
+    flow_matching:
+      time_distribution: logit_normal
+      high_sigma_ratio: 0.05
+      high_sigma_min: 0.98
+    conditional_frame_timestep: 0.0001
+
+  action_model:
+    action_model_type: DiT-B
+    rtc_max_delay: 16             # RTC ON: uniform delay d in [0,16], prefix rows frozen to clean GT
+                                  # + loss-masked (ActionDiT gates the whole branch on > 0; no new params)
+    hidden_size: 2560
+    add_pos_embed: True
+    max_seq_len: 1024
+    action_dim: 128               # body SONIC(64) ++ hand SONIC(64) -- matches pi0.5 (bhs5/bhs6)
+    state_dim: 46                 # 0922: MUST match the 46-D proprio base (q_dev29+grav3+dex3_current14).
+                                  # state_dim 32 here would build a 32-D state_encoder -> the base's
+                                  # 46-D state_encoder weights fail the shape filter and get RE-INIT
+                                  # (proprio grounding silently lost). Keep 46.
+    use_prev_tokens: false
+    use_state: false
+    future_action_window_size: 49
+    action_horizon: 50
+    past_action_window_size: 0
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 10
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      output_dim: 2560
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: sonic_token
+    include_state: true
+    include_hand_state: false     # 0922: match the base -- lagged hand token(64) EXCLUDED
+    include_hand_proprio: true    # 0922: +14 dex3_current (via dex3 decoder; EgoSuite too) -> 46-D
+    state_stats_path: /home/mealbaba/humanoid-vla/dit4dit_sonic_vla/assets/dit4dit_state_stats_prop46_0920.json
+    use_hand: true
+    default_image_resolution: [3, 224, 224]
+    image_size: [224, 224]
+    per_device_batch_size: 4
+    num_workers: 4
+    video_delta_indices: [0, 12, 24, 36, 48]
+    action_video_freq_ratio: 1
+    max_state_dim: 46
+    max_action_dim: 128
+    history: 0
+    history_stride: 20
+    history_dropout: 0.5
+    min_valid_frac: 0.9
+    samples_per_epoch: 200000
+    split: train
+    test_frac: 0.15
+    test_category: Locomanip
+    train_exclude_corpora: []
+    he_all_categories: true
+    # uniform mix, no anneal (weights == weights_end) -- mirrors the pi0.5 RTC ft (bhs6_rtcft).
+    weights: {humanoid_everyday: 0.2, psi: 0.2, unifolm_wbt: 0.2, leverb: 0.2, egosuite: 0.2}
+    weights_end: {humanoid_everyday: 0.2, psi: 0.2, unifolm_wbt: 0.2, leverb: 0.2, egosuite: 0.2}
+    mix_anneal_samples: 12800000
+
+trainer:
+  epochs: 100
+  max_train_steps: 20000        # 0917: 20k RTC ft (2x the pi0.5 10k ft, per request)
+  num_warmup_steps: 500         # ft: short warmup (was 5000 for the from-scratch mainline)
+  save_interval: 2000
+  keep_every_steps: 10000       # rotation keeps 10k + 20k milestones + rolling latest (~3 ckpts)
+  eval_interval: 500
+  eval_batches: 8
+  learning_rate:
+    base: 5e-06                  # halved from the mainline (ft): 1e-5 -> 5e-6
+    backbone_interface: 5.0e-06
+    action_model: 5.0e-05        # halved from the mainline (ft): 1e-4 -> 5e-5
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ''
+  repeated_diffusion_steps: 4
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  # WEIGHT-INIT fine-tune: load the 100k non-RTC base weights, then start a fresh 20k schedule
+  # (completed_steps=0). is_resume MUST stay false (true would instead look for a checkpoint in
+  # THIS run's own (empty) checkpoints/ dir and restore its step counter).
+  pretrained_checkpoint: /data/mert-checkpoints/dit4dit_sonic/dit4dit_nortc_bh_prop_0920/checkpoints/steps_100000_pytorch_model.pt
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true

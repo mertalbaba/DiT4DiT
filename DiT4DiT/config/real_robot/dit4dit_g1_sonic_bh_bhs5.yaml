@@ -2,9 +2,9 @@
 # action = [50, 128] = body SONIC(64) ++ hand SONIC(64) (matches pi0.5 bhs5/bhs6), the EXACT
 # bhs5 5-corpus mix + anneal, and training-time RTC OFF (rtc_max_delay: 0) to match the non-RTC
 # pi0.5 arm. Derived from dit4dit_g1_sonic.yaml (the 64-d body-only RTC mainline) with ONLY:
-# action_dim/max_action_dim 64->128, use_hand: true, rtc_max_delay 16->0. Everything else
-# (backbone, LR, 200k schedule, splits, state) is byte-identical -> only RTC and the hand head
-# differ from the RTC run. Eval logs eval/token_cos{,_body,_hand} + fsq_top1{,_body,_hand}.
+# action_dim/max_action_dim 64->128, use_hand: true, rtc_max_delay 16->0, and
+# max_train_steps 200k->150k (0917, matched to the pi05 150k mainline). Backbone, LR, splits,
+# and state are otherwise the mainline's. Eval logs eval/token_cos{,_body,_hand} + fsq_top1{,_body,_hand}.
 run_id: dit4dit_sonic_bh_nortc
 run_root_dir: results/Checkpoints
 seed: 42
@@ -41,8 +41,13 @@ framework:
     add_pos_embed: True
     max_seq_len: 1024
     action_dim: 128               # body SONIC(64) ++ hand SONIC(64) -- matches pi0.5 (bhs5/bhs6)
-    state_dim: 32                 # 32-D proprio (q_dev(29)+gravity(3)) -> ActionDiT's NATIVE state
-                                  # pathway (state_encoder -> one state token in the DiT sequence)
+    state_dim: 46                 # 0919: q_dev(29)+gravity(3)+dex3_current(14). Was 32 (body-only)
+                                  # -> the hand head trained ungrounded. NOTE: the pi0.5 lagged
+                                  # hand token(64) is DELIBERATELY EXCLUDED (0920): a past SONIC
+                                  # token encodes future motion, so it stays out of the conditioning
+                                  # /gradient path (same reason use_prev_tokens is off). dex3_current
+                                  # is measured joints only -> leak-free proprioception.
+                                  # -> ActionDiT's NATIVE state pathway (one state token in the DiT seq)
     use_prev_tokens: false        # 0905: OFF. SONIC tokens encode ~1s of FUTURE motion; at the
                                   # 0.4s history lag this leaked 60-92% of the target (copy-forward
                                   # training -> stand-still attractor at deployment, the 0706 run's
@@ -73,7 +78,18 @@ framework:
 datasets:
   vla_data:
     dataset_py: sonic_token       # -> DiT4DiT/dataloader/sonic_token_dataset.py (bypasses GR00T loader)
-    include_state: true           # emit the 32-D proprio state (quantile-normalized, pi0.5 stats)
+    include_state: true           # emit the proprio state (quantile-normalized)
+    include_hand_state: false     # 0920: lagged hand token(64) EXCLUDED -- keep past SONIC tokens
+                                  # (future-encoding) out of the input/gradient path.
+    include_hand_proprio: true    # 0919: +14 fresh dex3-equivalent CURRENT joints (via dex3 decoder;
+                                  # EgoSuite decodes its human hand token to dex3 space too). -> 46-D
+    # 46-D state stats SLICED from the pi0.5 110-D bhs stats (dims [0:32] q_dev+grav ++ [96:110]
+    # dex3_current), recomputed 0914 under the current v1.1+EgoSuite env -> per-dim identical to
+    # pi0.5 for the dims we keep, no recompute. Override via cfg only (not host_env SONIC_STATE_STATS,
+    # which the 32-D dit4dit runs still need).
+    state_stats_path: /home/mealbaba/humanoid-vla/dit4dit_sonic_vla/assets/dit4dit_state_stats_prop46_0920.json
+    hand_loss_weight: 1.0         # 1.0 = pi0.5 parity. Raise (e.g. 2-3) to upweight the hand-token
+                                  # loss if the hand head still lags body after this run.
     use_hand: true                # targets (50,128) = body(64) ++ hand(64) + per-dim action_mask
                                   # (LeVERB hand dims -> 0 loss/grad, ActionDiT loss is per-dim)
     default_image_resolution: [3, 224, 224]
@@ -84,7 +100,7 @@ datasets:
     # backbone num_frames_out = len(range(0, len(video_delta_indices), action_video_freq_ratio)).
     video_delta_indices: [0, 12, 24, 36, 48]
     action_video_freq_ratio: 1    # -> 5 frames (1 cond + 4 future)
-    max_state_dim: 32
+    max_state_dim: 46
     max_action_dim: 128
     # token-dataset knobs (defaults mirror the pi0.5 arm's SonicTokenDataConfig)
     history: 0                    # 0905: no prev-token history (see use_prev_tokens note)
@@ -101,12 +117,18 @@ datasets:
     # categories (was Locomanip-only). Set all weights to 0.2 for the uniform-mix ablation.
     he_all_categories: true
     weights: {humanoid_everyday: 0.08, psi: 0.08, unifolm_wbt: 0.08, leverb: 0.08, egosuite: 0.68}
-    weights_end: {humanoid_everyday: 0.25, psi: 0.25, unifolm_wbt: 0.2, leverb: 0.1, egosuite: 0.2}
-    mix_anneal_samples: 12800000
+    weights_end: {humanoid_everyday: 0.2, psi: 0.2, unifolm_wbt: 0.2, leverb: 0.2, egosuite: 0.2}  # 0911: uniform end mix
+    # 0919 FIX: was 12_800_000 -- at this run's global batch 32 (per_device 4 x 8 GPUs), 100-150k
+    # steps = only 3.2-4.8M samples, so the anneal never finished and the mix stayed EgoSuite-
+    # dominant (~0.54-0.68) the whole run -> the hand head fit HUMAN hands, weird on robot manip.
+    # pi0.5's larger batch (128) reached 12.8M and completed. 2.5M restores the SAME anneal shape
+    # (reaches the robot-heavy end mix by ~78k steps) at this batch size.
+    mix_anneal_samples: 2500000
 
 trainer:
   epochs: 100
-  max_train_steps: 200000
+  max_train_steps: 150000       # 0917: matched to the pi05 mainline (150k) for a same-step,
+                                # same-schedule (cosine over 150k) comparison
   num_warmup_steps: 5000
   save_interval: 5000
   eval_interval: 500

@@ -52,10 +52,20 @@ from pi05_sonic_vla.data.sonic_token_dataset import (  # noqa: E402
     TOKEN_DIM,
     HAND_TOKEN_DIM,
     STATE_DIM,
+    HAND_STATE_LAG,
     default_corpora,
     _load_state,
+    _dex3_current,
     _load_hand_window,
 )
+
+# Hand grounding appended to the 32-D base state, MIRRORING the pi0.5 arm's state layout
+# (pi05_sonic_vla/data/sonic_token_dataset.py __getitem__; openpi config.py pi05_sonic_bhs*):
+#   use_hand_state   -> +64  the 1 s-LAGGED hand token (strictly past -> no future leak; dropout)
+#   use_hand_proprio -> +14  fresh dex3-equivalent CURRENT joints (_dex3_current; never dropped)
+# Full pi0.5 parity = 32 + 64 + 14 = 110. EgoSuite gets proprio via _dex3_current's
+# hand_proprio_ref->hand_ref fallback (human hand token IS the measurement, not a commanded leak);
+# LeVERB (no hands) yields zeros for both blocks.
 
 # Default 32-D state normalization: reuse the stats computed for the pi0.5 arm (byte-identical
 # proprio data). Quantile (q01/q99) -> [-1,1], matching the pi0.5 arm + GR00T min-max spirit.
@@ -92,20 +102,28 @@ class SonicVideoTokenDataset(SonicTokenDataset):
         action_video_freq_ratio: int = 1,
         use_state: bool = False,
         state_stats_path: str | None = None,
+        hand_loss_weight: float = 1.0,
         **kwargs,
     ):
+        # use_hand_state / use_hand_proprio flow through **kwargs to the parent, which sets the
+        # matching attributes + hand_state_dropout; the state block below (mirroring the pi0.5
+        # arm) reads self.use_hand_state / self.use_hand_proprio to widen the state 32 -> 96 -> 110.
         super().__init__(corpora, **kwargs)
         self.video_offsets = _video_offsets(video_delta_indices, action_video_freq_ratio)
         if not self.video_offsets:
             raise ValueError("video_delta_indices/action_video_freq_ratio produced 0 frames")
         self.use_state = use_state
+        self.hand_loss_weight = float(hand_loss_weight)
         self._state_norm = (_load_state_norm(state_stats_path or _STATE_STATS_DEFAULT)
                             if use_state else None)
         if use_state and self._state_norm is None:
             print(f"[SonicVideoTokenDataset] WARNING: use_state but no state stats at "
                   f"{state_stats_path or _STATE_STATS_DEFAULT} -> emitting RAW state", flush=True)
+        _sdim = STATE_DIM + (HAND_TOKEN_DIM if self.use_hand_state else 0) + (14 if self.use_hand_proprio else 0)
         print(f"[SonicVideoTokenDataset] clip offsets (frames @ 50 Hz): {self.video_offsets} "
-              f"(cond=1, future={len(self.video_offsets) - 1}); use_state={use_state}", flush=True)
+              f"(cond=1, future={len(self.video_offsets) - 1}); use_state={use_state} "
+              f"state_dim={_sdim} (hand_state={self.use_hand_state}, hand_proprio={self.use_hand_proprio}) "
+              f"hand_loss_weight={self.hand_loss_weight}", flush=True)
 
     def _read_clip(self, rec, t: int) -> list[np.ndarray]:
         """Read frames at `t + offset` for every clip offset. Source-fps aware (Xperience)."""
@@ -169,6 +187,11 @@ class SonicVideoTokenDataset(SonicTokenDataset):
         action_mask = np.repeat(valid.astype(np.float32)[:, None], target.shape[-1], axis=1)
         if self.use_hand and not hand_present:
             action_mask[:, TOKEN_DIM:] = 0.0
+        # Upweight the hand-token loss: the hand head is undertrained vs the body head (body
+        # fsq_top1 ~0.5 vs hand ~0.3 at 120k). Loss is sum(err*mask)/sum(mask), so scaling the
+        # hand columns reweights the average toward hands. Train loader only (eval passes 1.0).
+        elif self.use_hand and self.hand_loss_weight != 1.0:
+            action_mask[:, TOKEN_DIM:] *= self.hand_loss_weight
 
         sample = {
             "image": frames,                          # list of (H, W, 3) uint8
@@ -181,10 +204,24 @@ class SonicVideoTokenDataset(SonicTokenDataset):
         }
         if self.use_state:
             st = _load_state(rec, t)                   # (32,) raw q_dev+gravity (shared pi0.5 loader)
+            # Hand grounding, byte-identical to the pi0.5 arm's state block
+            # (pi05_sonic_vla/data/sonic_token_dataset.py __getitem__):
+            if self.use_hand_state:                    # +64 the 1 s-LAGGED hand token (strictly past)
+                hs = np.zeros(HAND_TOKEN_DIM, np.float32)
+                ts = t - HAND_STATE_LAG
+                if ts >= 0 and self._rng.random() >= self.hand_state_dropout:
+                    hs_win, hs_present = _load_hand_window(rec, ts, 1)
+                    if hs_present:
+                        hs = hs_win[0]
+                st = np.concatenate([st, hs]).astype(np.float32)   # (96,)
+            if self.use_hand_proprio:                  # +14 fresh dex3-equivalent CURRENT joints,
+                # decoded from the hand token via hand_decoder_dex3 (frame 0 = now, no leak).
+                # EgoSuite: hand_proprio_ref->hand_ref fallback (human token IS measured), never dropped.
+                st = np.concatenate([st, _dex3_current(rec, t)]).astype(np.float32)  # (110,)
             if self._state_norm is not None:          # quantile -> [-1,1] (reuse pi0.5 state stats)
                 q01, q99 = self._state_norm
                 st = np.clip(2.0 * (st - q01) / np.maximum(q99 - q01, 1e-6) - 1.0, -1.0, 1.0)
-            # (1, 32): DiT4DiT.forward expects per-example state as [1, state_dim] (batches to
+            # (1, D): DiT4DiT.forward expects per-example state as [1, state_dim] (batches to
             # [B, 1, state_dim]; its .repeat(r, 1, 1) needs the 3-D layout). ActionDiT's native
             # state_encoder consumes it as one state token prepended to the action sequence.
             sample["state"] = st.astype(np.float32)[None, :]
@@ -246,7 +283,15 @@ def get_sonic_vla_dataset(cfg, split_override=None, samples_per_epoch_override=N
         test_category=str(d.get("test_category", "Locomanip")),
         train_exclude_corpora=tuple(d.get("train_exclude_corpora", ()) or ()),
         use_hand=bool(d.get("use_hand", False)),
+        # pi0.5-parity hand grounding in the state (parent consumes these; state 32->96->110)
+        use_hand_state=bool(d.get("include_hand_state", False)),
+        use_hand_proprio=bool(d.get("include_hand_proprio", False)),
+        hand_state_dropout=float(d.get("hand_state_dropout", 0.5)),
     )
+    _split = str(split_override if split_override is not None else d.get("split", "train"))
+    # hand-loss upweight applies to the TRAIN loader only; the eval loader keeps 1.0 so its
+    # fsq/mse metrics stay comparable across runs.
+    hand_lw = float(d.get("hand_loss_weight", 1.0)) if _split == "train" else 1.0
     # 0905 bhs5-parity: linear-in-samples mix anneal (needs _maybe_anneal() in __getitem__).
     we = d.get("weights_end", None)
     if we:
@@ -264,6 +309,7 @@ def get_sonic_vla_dataset(cfg, split_override=None, samples_per_epoch_override=N
         action_video_freq_ratio=int(d.get("action_video_freq_ratio", 1)),
         use_state=bool(d.get("include_state", False)),
         state_stats_path=d.get("state_stats_path", None),
+        hand_loss_weight=hand_lw,
         **kwargs,
     )
 
